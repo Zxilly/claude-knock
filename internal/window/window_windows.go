@@ -5,6 +5,8 @@ package window
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -19,6 +21,7 @@ var (
 	procSetForegroundWnd   = moduser32.NewProc("SetForegroundWindow")
 	procShowWindow         = moduser32.NewProc("ShowWindow")
 	procIsIconic           = moduser32.NewProc("IsIconic")
+	procGetWindowTextW     = moduser32.NewProc("GetWindowTextW")
 )
 
 const (
@@ -26,7 +29,9 @@ const (
 )
 
 // FindAncestorWindow walks up the process tree from the current process
-// to find the first visible top-level window.
+// to find the best matching visible top-level window.
+// When multiple windows exist for the same process (e.g., multiple VSCode/Cursor windows),
+// it tries to match the window title with the current working directory.
 func FindAncestorWindow() (uintptr, error) {
 	pid := uint32(os.Getpid())
 	chain, err := BuildParentChain(pid)
@@ -34,8 +39,12 @@ func FindAncestorWindow() (uintptr, error) {
 		return 0, fmt.Errorf("build parent chain: %w", err)
 	}
 
+	// Get current working directory name for matching
+	cwd, _ := os.Getwd()
+	cwdName := filepath.Base(cwd)
+
 	for _, p := range chain {
-		hwnd := findVisibleWindowForPID(p)
+		hwnd := findBestWindowForPID(p, cwdName)
 		if hwnd != 0 {
 			return uintptr(hwnd), nil
 		}
@@ -43,9 +52,12 @@ func FindAncestorWindow() (uintptr, error) {
 	return 0, fmt.Errorf("no visible ancestor window found")
 }
 
-// findVisibleWindowForPID finds a visible top-level window owned by the given PID.
-func findVisibleWindowForPID(targetPID uint32) windows.HWND {
-	var found windows.HWND
+// findBestWindowForPID finds the best matching visible window for the given PID.
+// If cwdName is provided, it prefers windows whose title contains the cwd name.
+// Falls back to any visible window if no match is found.
+func findBestWindowForPID(targetPID uint32, cwdName string) windows.HWND {
+	var matchedWindow windows.HWND
+	var fallbackWindow windows.HWND
 
 	cb := syscall.NewCallback(func(hwnd windows.HWND, lparam uintptr) uintptr {
 		var pid uint32
@@ -57,12 +69,40 @@ func findVisibleWindowForPID(targetPID uint32) windows.HWND {
 		if visible == 0 {
 			return 1 // continue
 		}
-		found = hwnd
-		return 0 // stop
+
+		// Get window title
+		title := getWindowText(hwnd)
+		if title == "" {
+			return 1 // continue, skip windows without title
+		}
+
+		// Record as fallback
+		if fallbackWindow == 0 {
+			fallbackWindow = hwnd
+		}
+
+		// Check if title contains the cwd name (case-insensitive)
+		if cwdName != "" && strings.Contains(strings.ToLower(title), strings.ToLower(cwdName)) {
+			matchedWindow = hwnd
+			return 0 // stop, found the best match
+		}
+
+		return 1 // continue looking for a better match
 	})
 
 	procEnumWindows.Call(cb, 0)
-	return found
+
+	if matchedWindow != 0 {
+		return matchedWindow
+	}
+	return fallbackWindow
+}
+
+// getWindowText retrieves the title of a window.
+func getWindowText(hwnd windows.HWND) string {
+	buf := make([]uint16, 256)
+	procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return windows.UTF16ToString(buf)
 }
 
 // Activate brings a window to the foreground. If minimized, it restores first.
